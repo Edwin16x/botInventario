@@ -1,5 +1,5 @@
-python-telegram-bot
-gspread
-google-auth
+python-telegram-bot==20.8
 flask
-google-api-python-client
+supabase
+pandas
+openpyxl
