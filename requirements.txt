@@ -2,3 +2,4 @@ python-telegram-bot
 gspread
 google-auth
 flask
+google-api-python-client
