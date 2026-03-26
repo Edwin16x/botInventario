@@ -11,29 +11,30 @@ from telegram.ext import (
 from flask import Flask
 
 # ==========================================
-# 1. CONFIGURACIÓN Y SERVIDOR WEB
+# 1. CONFIGURACIÓN DE IDs (PEGA LOS TUYOS AQUÍ)
 # ==========================================
+ID_SHEET = "1FVlZOft3MKbiJkPJVk5nbAD1sulVDXYbRFnANdDxVtw" # El ID de la URL de tu Sheet
+
 app_flask = Flask(__name__)
+SELECCIONAR_TABLA, RECOLECTAR_DATOS = range(2)
 
 @app_flask.route('/')
 def home():
-    return "✅ Inventario Online"
+    return "✅ Bot de Inventario Dinámico por ID en línea."
 
 def run_web_server():
+    # Render usa el puerto 10000 por defecto para Web Services
     port = int(os.environ.get("PORT", 10000))
     app_flask.run(host="0.0.0.0", port=port)
 
 # ==========================================
-# 2. CONEXIÓN ROBUSTA A GOOGLE SHEETS
+# 2. CONEXIÓN A GOOGLE
 # ==========================================
-# CAMBIA ESTO AL NOMBRE EXACTO DE TU ARCHIVO DE GOOGLE SHEETS
-NOMBRE_ARCHIVO_SHEETS = "Inventario_Residencias" 
-
 def conectar_sheets():
     try:
         google_json = os.environ.get("GOOGLE_CREDENTIALS")
         if not google_json:
-            print("❌ ERROR: Falta variable GOOGLE_CREDENTIALS")
+            print("❌ ERROR: No se encontró la variable GOOGLE_CREDENTIALS")
             return None
             
         creds_dict = json.loads(google_json)
@@ -43,103 +44,111 @@ def conectar_sheets():
         ])
         return gspread.authorize(creds)
     except Exception as e:
-        print(f"❌ Error conectando a Google: {e}")
+        print(f"❌ Error en autenticación: {e}")
         return None
 
-# Instancia global del cliente
 cliente_gspread = conectar_sheets()
 
 # ==========================================
-# 3. LÓGICA DEL BOT (MÁQUINA DE ESTADOS)
+# 3. MÁQUINA DE ESTADOS DINÁMICA
 # ==========================================
-CATEGORIA, PRODUCTO, CANTIDAD = range(3)
 
-async def iniciar_ingreso(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    teclado = [
-        [InlineKeyboardButton("🥾 Calzado", callback_data='Calzado')],
-        [InlineKeyboardButton("🔧 Herramientas", callback_data='Herramientas')],
-        [InlineKeyboardButton("🔌 Electrónica", callback_data='Electronica')]
-    ]
-    reply_markup = InlineKeyboardMarkup(teclado)
-    await update.message.reply_text('¿En qué categoría vas a registrar?', reply_markup=reply_markup)
-    return CATEGORIA
+async def iniciar_registro(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        # Abrimos el libro usando el ID inmutable
+        libro = cliente_gspread.open_by_key(ID_SHEET)
+        hojas = libro.worksheets()
+        
+        # Generamos botones basados en las pestañas reales del Excel
+        teclado = [[InlineKeyboardButton(f"📁 {h.title}", callback_data=h.title)] for h in hojas]
+        reply_markup = InlineKeyboardMarkup(teclado)
+        
+        await update.message.reply_text("📦 *Sistema de Inventario*\nSelecciona la categoría:", 
+                                      reply_markup=reply_markup, parse_mode='Markdown')
+        return SELECCIONAR_TABLA
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error al conectar con la Sheet ID: {e}")
+        return ConversationHandler.END
 
-async def recibir_categoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def seleccionar_tabla(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data['categoria'] = query.data
-    await query.edit_message_text(f"Elegiste: *{query.data}*\nEscribe el nombre del producto:", parse_mode='Markdown')
-    return PRODUCTO
-
-async def recibir_producto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['producto'] = update.message.text
-    await update.message.reply_text("Ingresa la cantidad (solo números):")
-    return CANTIDAD
-
-async def recibir_cantidad(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cantidad_texto = update.message.text
-    if not cantidad_texto.isdigit():
-        await update.message.reply_text("⚠️ Por favor, ingresa solo números.")
-        return CANTIDAD
-
-    categoria = context.user_data['categoria']
-    producto = context.user_data['producto']
-    usuario = update.message.from_user.username or update.message.from_user.first_name
     
-    await update.message.reply_text("⏳ Guardando en la base de datos...")
-
-    try:
-        # Forzar reconexión si el cliente falló
-        global cliente_gspread
-        if not cliente_gspread:
-            cliente_gspread = conectar_sheets()
-
-        # Abrir libro y hoja
-        libro = cliente_gspread.open(NOMBRE_ARCHIVO_SHEETS)
-        hoja = libro.worksheet(categoria)
-        
-        # Insertar datos: Producto, Cantidad, Usuario, Estado
-        hoja.append_row([producto, int(cantidad_texto), usuario, "Registrado"])
-        
-        await update.message.reply_text(f"✅ ¡Éxito! {producto} guardado en {categoria}.")
+    tabla_nombre = query.data
+    context.user_data['tabla_nombre'] = tabla_nombre
     
-    except gspread.exceptions.WorksheetNotFound:
-        await update.message.reply_text(f"❌ Error: La pestaña '{categoria}' no existe en el Excel.")
-    except Exception as e:
-        print(f"DEBUG ERROR: {e}") # Esto aparecerá en los logs de Render
-        await update.message.reply_text(f"❌ Error de conexión con Google Sheets. Verifica permisos.")
+    # Obtenemos la hoja y leemos la fila 1 (Encabezados)
+    hoja = cliente_gspread.open_by_key(ID_SHEET).worksheet(tabla_nombre)
+    encabezados = hoja.row_values(1)
+    
+    if not encabezados:
+        await query.edit_message_text("❌ La tabla está vacía (sin encabezados en la Fila 1).")
+        return ConversationHandler.END
 
-    return ConversationHandler.END
+    context.user_data['columnas'] = encabezados
+    context.user_data['respuestas'] = []
+    context.user_data['indice_pregunta'] = 0
+    
+    await query.edit_message_text(f"📝 Registro en: *{tabla_nombre}*\nIntroduce: *{encabezados[0]}*", parse_mode='Markdown')
+    return RECOLECTAR_DATOS
+
+async def recolectar_datos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    columnas = context.user_data['columnas']
+    idx = context.user_data['indice_pregunta']
+    
+    # Guardamos la respuesta del usuario
+    context.user_data['respuestas'].append(update.message.text)
+    
+    # Si faltan más columnas por preguntar
+    if idx + 1 < len(columnas):
+        context.user_data['indice_pregunta'] += 1
+        siguiente_campo = columnas[idx + 1]
+        await update.message.reply_text(f"Siguiente dato: *{siguiente_campo}*", parse_mode='Markdown')
+        return RECOLECTAR_DATOS
+    else:
+        # Final de las preguntas, procedemos a guardar
+        await update.message.reply_text("⏳ Procesando registro...")
+        try:
+            hoja = cliente_gspread.open_by_key(ID_SHEET).worksheet(context.user_data['tabla_nombre'])
+            hoja.append_row(context.user_data['respuestas'])
+            await update.message.reply_text(f"✅ ¡Éxito! Registro guardado en *{context.user_data['tabla_nombre']}*.", parse_mode='Markdown')
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error al guardar fila: {e}")
+        
+        return ConversationHandler.END
 
 async def cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Operación cancelada.")
+    await update.message.reply_text("🛑 Operación cancelada por el usuario.")
     return ConversationHandler.END
 
 # ==========================================
-# 4. MAIN
+# 4. INICIO DEL BOT
 # ==========================================
 def main():
     TOKEN = os.environ.get("TELEGRAM_TOKEN")
-    app_bot = Application.builder().token(TOKEN).build()
+    if not TOKEN:
+        print("❌ No hay TOKEN")
+        return
+
+    app = Application.builder().token(TOKEN).build()
 
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('ingresar', iniciar_ingreso)],
+        entry_points=[CommandHandler('ingresar', iniciar_registro)],
         states={
-            CATEGORIA: [CallbackQueryHandler(recibir_categoria)],
-            PRODUCTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_producto)],
-            CANTIDAD: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_cantidad)],
+            SELECCIONAR_TABLA: [CallbackQueryHandler(seleccionar_tabla)],
+            RECOLECTAR_DATOS: [MessageHandler(filters.TEXT & ~filters.COMMAND, recolectar_datos)],
         },
         fallbacks=[CommandHandler('cancelar', cancelar)]
     )
 
-    app_bot.add_handler(conv_handler)
-    app_bot.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("Bot Activo. Usa /ingresar")))
+    app.add_handler(conv_handler)
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("Bot de Inventario. Usa /ingresar")))
 
-    # Hilo para Flask (Render)
+    # Iniciar servidor web para Render
     threading.Thread(target=run_web_server, daemon=True).start()
     
-    print("🤖 Bot listo.")
-    app_bot.run_polling()
+    print("🤖 Bot iniciado y escuchando...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
